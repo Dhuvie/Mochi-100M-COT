@@ -1,0 +1,22 @@
+[
+  {
+    "name": "wikipedia",
+    "dataset": "wikimedia/wikipedia",
+    "config": "20231101.en",
+    "snapshot_date": "2023-11-01",
+    "seen": 2000000,
+    "kept": 1901070,
+    "too_short": 98830,
+    "duplicates": 100
+  },
+  {
+    "name": "fineweb-edu",
+    "dataset": "HuggingFaceFW/fineweb-edu",
+    "config": "sample-10BT",
+    "snapshot_date": null,
+    "seen": 1500000,
+    "kept": 1491630,
+    "too_short": 16,
+    "duplicates": 8354
+  }
+]

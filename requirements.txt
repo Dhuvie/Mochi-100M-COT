@@ -1,0 +1,9 @@
+torch>=2.2
+numpy
+tokenizers
+datasets
+gguf
+matplotlib
+huggingface_hub
+# optional, only needed for the llama.cpp comparison in verify_gguf.py
+# llama-cpp-python
