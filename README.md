@@ -143,7 +143,7 @@ The output unembedding matrix that maps final normalized hidden states back to v
 | Token Embeddings ($W_e$) | $32,000 \times 768$ | 24,576,000 |
 | Positional Embeddings ($W_p$) | $512 \times 768$ | 393,216 |
 | Transformer Blocks ($11 \times$) | 11 layers $\times$ 7,087,872 parameters | 77,966,592 |
-| Final LayerNorm ($\text{ln\_f}$) | Scale ($\gamma$) and Bias ($\beta$) of size 768 | 1,536 |
+| Final LayerNorm (`ln_f`) | Scale ($\gamma$) and Bias ($\beta$) of size 768 | 1,536 |
 | Output Projection ($W_{\text{out}}$) | Tied to $W_e$ (0 additional unique parameters) | 0 |
 | **Total Active Trainable Parameters** | **Mochi-103M Complete Model** | **102,937,344** |
 
