@@ -29,20 +29,33 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size),
                              persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
         batch, seq_len, n_embd = x.shape                          # (B, T, C)
         q, k, v = self.c_attn(x).split(n_embd, dim=2)             # each (B, T, C)
         q = q.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
         k = k.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
 
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, nh, T, T)
-        # a token may only attend to itself and earlier tokens
-        scores = scores.masked_fill(self.causal_mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        present_kv = (k, v) if use_cache else None
+        total_k_len = k.shape[2]
+
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, nh, T, total_k_len)
+        if seq_len > 1:
+            # During prompt processing, a token may only attend to itself and earlier tokens
+            scores = scores.masked_fill(self.causal_mask[:, :, :seq_len, :total_k_len] == 0, float("-inf"))
+
         weights = self.attn_dropout(F.softmax(scores, dim=-1))
         out = weights @ v                                              # (B, nh, T, hd)
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, n_embd)
-        return self.resid_dropout(self.c_proj(out))
+        res = self.resid_dropout(self.c_proj(out))
+        if use_cache:
+            return res, present_kv
+        return res
 
 
 class MLP(nn.Module):
@@ -65,7 +78,12 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
+        if use_cache:
+            attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
+            return x, present_kv
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -100,17 +118,34 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
-        """idx: (B, T) token ids. Returns (logits, loss).
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, past_kv=None, use_cache: bool = False):
+        """idx: (B, T) token ids. Returns (logits, loss) or (logits, present_kv).
 
         With targets, logits cover every position. Without targets only the last
         position is computed, which is all that generation needs.
         """
         batch, seq_len = idx.shape
-        assert seq_len <= self.config.block_size, "sequence longer than block_size"
-        positions = torch.arange(seq_len, device=idx.device)
+        if past_kv is None:
+            assert seq_len <= self.config.block_size, "sequence longer than block_size"
+            positions = torch.arange(seq_len, device=idx.device)
+        else:
+            past_len = past_kv[0][0].shape[2]
+            assert past_len + seq_len <= self.config.block_size, "sequence + cache exceeds block_size"
+            positions = torch.arange(past_len, past_len + seq_len, device=idx.device)
+
         x = self.transformer.wte(idx) + self.transformer.wpe(positions)  # (B, T, C)
         x = self.transformer.drop(x)
+
+        if use_cache:
+            present_kvs = []
+            for i, block in enumerate(self.transformer.h):
+                layer_past = past_kv[i] if past_kv is not None else None
+                x, layer_present = block(x, past_kv=layer_past, use_cache=True)
+                present_kvs.append(layer_present)
+            x = self.transformer.ln_f(x)
+            logits = self.lm_head(x[:, -1:, :])
+            return logits, present_kvs
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -123,13 +158,23 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
-                 top_k: int = None, top_p: float = None, eos_token_id: int = None) -> torch.Tensor:
-        """Autoregressive sampling. temperature=0 means greedy decoding."""
+                 top_k: int = None, top_p: float = None, min_p: float = None,
+                 eos_token_id: int = None, use_cache: bool = True) -> torch.Tensor:
+        """Autoregressive sampling with optional KV-cache and Min-P sampling."""
         was_training = self.training
         self.eval()
-        for _ in range(max_new_tokens):
-            context = idx[:, -self.config.block_size:]
-            logits, _ = self(context)
+
+        past_kv = None
+        for step in range(max_new_tokens):
+            if use_cache:
+                if step == 0:
+                    logits, past_kv = self(idx[:, -self.config.block_size:], use_cache=True)
+                else:
+                    logits, past_kv = self(idx[:, -1:], past_kv=past_kv, use_cache=True)
+            else:
+                context = idx[:, -self.config.block_size:]
+                logits, _ = self(context)
+
             logits = logits[:, -1, :]
 
             if temperature == 0:
@@ -145,6 +190,11 @@ class GPT(nn.Module):
                     remove = cumulative - F.softmax(sorted_logits, dim=-1) > top_p
                     sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
                     logits = torch.full_like(logits, float("-inf")).scatter(1, sorted_idx, sorted_logits)
+                if min_p is not None and min_p > 0.0:
+                    probs_all = F.softmax(logits, dim=-1)
+                    p_max = torch.max(probs_all, dim=-1, keepdim=True)[0]
+                    p_thresh = p_max * min_p
+                    logits = logits.masked_fill(probs_all < p_thresh, float("-inf"))
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 

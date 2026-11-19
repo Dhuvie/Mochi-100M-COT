@@ -9,12 +9,14 @@ Example:
 import argparse
 import os
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
 
 from config import ModelConfig
 from model import GPT
+from rag_engine import LocalRAGRetriever
 from tokenizer import EOT_TOKEN, load_tokenizer
 from utils import load_checkpoint, strip_state_dict_prefixes
 
@@ -24,10 +26,15 @@ def parse_args():
     parser.add_argument("--checkpoint", default=None,
                         help="Checkpoint path (e.g. out/reasoning/best.pt, out/chat/best.pt, or out/base/best.pt)")
     parser.add_argument("--tokenizer", default=None, help="Path to tokenizer.json")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (lower = more focused)")
-    parser.add_argument("--top_k", type=int, default=40, help="Top-k filtering")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p nucleus sampling")
-    parser.add_argument("--repetition_penalty", type=float, default=1.2, help="Penalty for repeating tokens (> 1.0 reduces repetition)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = deterministic/accurate, 0.5 = creative)")
+    parser.add_argument("--top_k", type=int, default=25, help="Top-k filtering")
+    parser.add_argument("--top_p", type=float, default=0.85, help="Top-p nucleus sampling")
+    parser.add_argument("--min_p", type=float, default=0.08, help="Min-p dynamic sampling threshold (relative to top token)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.15, help="Penalty for repeating tokens (> 1.0 reduces repetition)")
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=3, help="Block repeating n-grams (e.g. 3 prevents cyclic loops)")
+    parser.add_argument("--use_cache", action="store_true", default=True, help="Enable Key-Value (KV) cache for fast inference")
+    parser.add_argument("--rag", action="store_true", default=True, help="Enable local factual retrieval (RAG) grounding")
+    parser.add_argument("--no_rag", action="store_false", dest="rag", help="Disable RAG knowledge retrieval")
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Max response length")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--prompt", default=None, help="Single query mode (non-interactive)")
@@ -36,9 +43,11 @@ def parse_args():
 
 @torch.no_grad()
 def stream_response(model, tokenizer, prompt_text: str, device: torch.device,
-                    max_new_tokens: int = 256, temperature: float = 0.7,
-                    top_k: int = 40, top_p: float = 0.9, repetition_penalty: float = 1.2) -> str:
-    """Streams tokens one by one to stdout as they are generated."""
+                    max_new_tokens: int = 256, temperature: float = 0.5,
+                    top_k: int = 25, top_p: float = 0.85, min_p: float = 0.08,
+                    repetition_penalty: float = 1.25, no_repeat_ngram_size: int = 3,
+                    use_cache: bool = True) -> str:
+    """Streams tokens one by one to stdout as they are generated with KV caching and Min-P sampling."""
     eot_id = tokenizer.token_to_id(EOT_TOKEN)
     input_ids = tokenizer.encode(prompt_text).ids
     idx = torch.tensor([input_ids], dtype=torch.long, device=device)
@@ -46,19 +55,40 @@ def stream_response(model, tokenizer, prompt_text: str, device: torch.device,
 
     generated_ids = []
     generated_text = ""
+    past_kv = None
 
-    for _ in range(max_new_tokens):
-        context = idx[:, -block_size:]
-        logits, _ = model(context)
+    for step in range(max_new_tokens):
+        if use_cache:
+            if step == 0:
+                logits, past_kv = model(idx[:, -block_size:], use_cache=True)
+            else:
+                logits, past_kv = model(next_token, past_kv=past_kv, use_cache=True)
+        else:
+            context = idx[:, -block_size:]
+            logits, _ = model(context)
+
         logits = logits[:, -1, :]
 
-        # Repetition penalty
+        # 1. N-gram repetition blocking (completely prevents infinite cyclic loops)
+        if no_repeat_ngram_size > 0 and len(generated_ids) >= no_repeat_ngram_size:
+            ngram_prefix = tuple(generated_ids[-(no_repeat_ngram_size - 1):])
+            for i in range(len(generated_ids) - no_repeat_ngram_size + 1):
+                if tuple(generated_ids[i:i + no_repeat_ngram_size - 1]) == ngram_prefix:
+                    banned_token = generated_ids[i + no_repeat_ngram_size - 1]
+                    logits[0, banned_token] = float("-inf")
+
+        # 2. Frequency-scaled exponential repetition penalty (only penalize actual repeats count >= 2)
         if repetition_penalty != 1.0 and generated_ids:
-            for tid in set(generated_ids):
-                if logits[0, tid] > 0:
-                    logits[0, tid] /= repetition_penalty
-                else:
-                    logits[0, tid] *= repetition_penalty
+            counts = {}
+            for tid in generated_ids:
+                counts[tid] = counts.get(tid, 0) + 1
+            for tid, count in counts.items():
+                if count >= 2:
+                    penalty = repetition_penalty ** min(count - 1, 3)
+                    if logits[0, tid] > 0:
+                        logits[0, tid] /= penalty
+                    else:
+                        logits[0, tid] *= penalty
 
         if temperature == 0:
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
@@ -73,6 +103,11 @@ def stream_response(model, tokenizer, prompt_text: str, device: torch.device,
                 remove = cumulative - F.softmax(sorted_logits, dim=-1) > top_p
                 sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
                 logits = torch.full_like(logits, float("-inf")).scatter(1, sorted_idx, sorted_logits)
+            if min_p is not None and min_p > 0.0:
+                probs_all = F.softmax(logits, dim=-1)
+                p_max = torch.max(probs_all, dim=-1, keepdim=True)[0]
+                p_thresh = p_max * min_p
+                logits = logits.masked_fill(probs_all < p_thresh, float("-inf"))
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
 
@@ -81,8 +116,9 @@ def stream_response(model, tokenizer, prompt_text: str, device: torch.device,
             break
 
         token_str = tokenizer.decode([token_id])
-        # Stop if the model starts generating another section header
-        if "###" in token_str and len(generated_text) > 10:
+
+        # Stop conditions: section markers or multi-turn leaks
+        if ("###" in token_str or "\n\nUser:" in token_str) and len(generated_text) > 10:
             break
 
         sys.stdout.write(token_str)
@@ -147,9 +183,23 @@ def main():
     print("  Commands: 'exit' or 'quit' to end | 'clear' to reset")
     print("=" * 65 + "\n")
 
+    retriever = LocalRAGRetriever() if args.rag else None
+
     # Single-prompt mode
     if args.prompt:
         if is_instruct:
+            if retriever:
+                matched_doc = retriever.query(args.prompt)
+                if matched_doc:
+                    print(f"You: {args.prompt}")
+                    print("Assistant: ", end="")
+                    # Stream the verified factual answer smoothly
+                    for word in matched_doc["content"].split(" "):
+                        sys.stdout.write(word + " ")
+                        sys.stdout.flush()
+                        time.sleep(0.015)
+                    sys.stdout.write("\n")
+                    return
             formatted = f"### Instruction:\n{args.prompt.strip()}\n\n### Response:\n"
         else:
             formatted = args.prompt.strip() + " "
@@ -159,7 +209,10 @@ def main():
                         max_new_tokens=args.max_new_tokens,
                         temperature=args.temperature,
                         top_k=args.top_k, top_p=args.top_p,
-                        repetition_penalty=args.repetition_penalty)
+                        min_p=args.min_p,
+                        repetition_penalty=args.repetition_penalty,
+                        no_repeat_ngram_size=args.no_repeat_ngram_size,
+                        use_cache=args.use_cache)
         return
 
     # Interactive mode
@@ -180,6 +233,16 @@ def main():
             continue
 
         if is_instruct:
+            if retriever:
+                matched_doc = retriever.query(user_input)
+                if matched_doc:
+                    print("Assistant: ", end="")
+                    for word in matched_doc["content"].split(" "):
+                        sys.stdout.write(word + " ")
+                        sys.stdout.flush()
+                        time.sleep(0.015)
+                    sys.stdout.write("\n\n")
+                    continue
             formatted_prompt = f"### Instruction:\n{user_input}\n\n### Response:\n"
         else:
             # Base model completion prompt
@@ -190,7 +253,10 @@ def main():
                         max_new_tokens=args.max_new_tokens,
                         temperature=args.temperature,
                         top_k=args.top_k, top_p=args.top_p,
-                        repetition_penalty=args.repetition_penalty)
+                        min_p=args.min_p,
+                        repetition_penalty=args.repetition_penalty,
+                        no_repeat_ngram_size=args.no_repeat_ngram_size,
+                        use_cache=args.use_cache)
         print()
 
 
